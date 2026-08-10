@@ -57,6 +57,21 @@ def parse_glyphs(text):
     return glyphs
 
 
+def parse_compact_glyphs(text):
+    """Parse EpdCompactGlyph entries: { width, height, left, top, dataLength }."""
+    glyphs = []
+    for match in re.finditer(
+            r'\{\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*\}', text):
+        glyphs.append({
+            'width': int(match.group(1)),
+            'height': int(match.group(2)),
+            'left': int(match.group(3)),
+            'top': int(match.group(4)),
+            'dataLength': int(match.group(5)),
+        })
+    return glyphs
+
+
 def get_group_glyph_indices(group, group_index, glyphs, glyph_to_group):
     """Get the ordered list of glyph indices belonging to a group."""
     if glyph_to_group is not None:
@@ -68,32 +83,87 @@ def get_group_glyph_indices(group, group_index, glyphs, glyph_to_group):
         return list(range(first, first + group['glyphCount']))
 
 
-def compact_aligned_to_packed(aligned_data, width, height):
-    """Convert byte-aligned 2-bit bitmap to packed format (reverse of to_byte_aligned).
+def compact_aligned_to_packed(aligned_data, width, height, bits_per_pixel=2):
+    """Convert byte-aligned bitmap rows to the firmware's continuous packing.
 
     In byte-aligned format, each row starts at a byte boundary.
     In packed format, pixels flow continuously across row boundaries (4 pixels/byte).
     """
     if width == 0 or height == 0:
         return b''
-    packed_size = math.ceil(width * height / 4)
+    pixels_per_byte = 8 // bits_per_pixel
+    mask = (1 << bits_per_pixel) - 1
+    packed_size = math.ceil(width * height * bits_per_pixel / 8)
     packed = bytearray(packed_size)
-    row_stride = (width + 3) // 4  # bytes per byte-aligned row
+    row_stride = math.ceil(width * bits_per_pixel / 8)
 
     for y in range(height):
         for x in range(width):
             # Read pixel from byte-aligned format (row-aligned)
-            aligned_byte_idx = y * row_stride + x // 4
-            aligned_shift = (3 - (x % 4)) * 2
-            pixel = (aligned_data[aligned_byte_idx] >> aligned_shift) & 0x3
+            aligned_byte_idx = y * row_stride + x // pixels_per_byte
+            aligned_shift = (pixels_per_byte - 1 - (x % pixels_per_byte)) * bits_per_pixel
+            pixel = (aligned_data[aligned_byte_idx] >> aligned_shift) & mask
 
             # Write pixel to packed format (continuous bit stream)
             packed_pos = y * width + x
-            packed_byte_idx = packed_pos // 4
-            packed_shift = (3 - (packed_pos % 4)) * 2
+            packed_byte_idx = packed_pos // pixels_per_byte
+            packed_shift = (pixels_per_byte - 1 - (packed_pos % pixels_per_byte)) * bits_per_pixel
             packed[packed_byte_idx] |= (pixel << packed_shift)
 
     return bytes(packed)
+
+
+def verify_mono_variant(content, font_name):
+    """Verify the optional independently compressed 1-bit variant."""
+    prefix = font_name + "Mono"
+    if f"static const EpdFontGroup {prefix}Groups[]" not in content:
+        return True, ""
+
+    bitmap_match = re.search(
+        r'static const uint8_t ' + re.escape(prefix) + r'Bitmaps\[\d+\]\s*=\s*\{([^}]+)\}',
+        content, re.DOTALL)
+    groups_match = re.search(
+        r'static const EpdFontGroup ' + re.escape(prefix) + r'Groups\[\]\s*=\s*\{(.+?)\};',
+        content, re.DOTALL)
+    glyphs_match = re.search(
+        r'static const EpdCompactGlyph ' + re.escape(prefix) + r'Glyphs\[\]\s*=\s*\{(.+?)\};',
+        content, re.DOTALL)
+    if not bitmap_match or not groups_match or not glyphs_match:
+        return False, "incomplete mono arrays"
+
+    compressed_data = parse_hex_array(bitmap_match.group(1))
+    groups = parse_groups(groups_match.group(1))
+    glyphs = parse_compact_glyphs(glyphs_match.group(1))
+    for gi, group in enumerate(groups):
+        chunk = compressed_data[group['compressedOffset']:group['compressedOffset'] + group['compressedSize']]
+        try:
+            decompressed = zlib.decompress(chunk, -15)
+        except zlib.error as exc:
+            return False, f"mono group {gi}: decompression failed: {exc}"
+        if len(decompressed) != group['uncompressedSize']:
+            return False, f"mono group {gi}: uncompressed size mismatch"
+
+        aligned_offset = 0
+        packed_offset = 0
+        for glyph_idx in range(group['firstGlyphIndex'], group['firstGlyphIndex'] + group['glyphCount']):
+            if glyph_idx >= len(glyphs):
+                return False, f"mono group {gi}: glyph index out of range"
+            glyph = glyphs[glyph_idx]
+            width, height = glyph['width'], glyph['height']
+            aligned_size = math.ceil(width / 8) * height if width and height else 0
+            packed_size = math.ceil(width * height / 8)
+            if glyph['dataLength'] != packed_size:
+                return False, f"mono group {gi}, glyph {glyph_idx}: packed metadata mismatch"
+            end = aligned_offset + aligned_size
+            if end > len(decompressed):
+                return False, f"mono group {gi}, glyph {glyph_idx}: aligned data truncated"
+            if len(compact_aligned_to_packed(decompressed[aligned_offset:end], width, height, 1)) != packed_size:
+                return False, f"mono group {gi}, glyph {glyph_idx}: compaction size mismatch"
+            aligned_offset = end
+            packed_offset += packed_size
+        if aligned_offset != group['uncompressedSize']:
+            return False, f"mono group {gi}: aligned size mismatch"
+    return True, f", mono {len(groups)} groups OK"
 
 
 def verify_font_file(filepath):
@@ -227,7 +297,10 @@ def verify_font_file(filepath):
     extra_info = ""
     if glyph_to_group is not None:
         extra_info = " (frequency-grouped)"
-    return (font_name, True, f"{len(groups)} groups, {len(glyphs)} glyphs OK{extra_info}")
+    mono_ok, mono_message = verify_mono_variant(content, font_name)
+    if not mono_ok:
+        return (font_name, False, mono_message)
+    return (font_name, True, f"{len(groups)} groups, {len(glyphs)} glyphs OK{extra_info}{mono_message}")
 
 
 def main():

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Generate .cpfont binary files for SD card font loading.
 
-Outputs binary .cpfont files containing glyph metadata and uncompressed
-2-bit bitmaps, matching the EpdFontData/EpdGlyph/EpdUnicodeInterval struct
-layout on the ESP32-C3 (little-endian, RISC-V).
+Outputs binary .cpfont files containing shared layout data plus independently
+rasterized, uncompressed 2-bit grayscale and 1-bit monochrome glyph variants.
+The layout matches EpdFontData/EpdGlyph/EpdUnicodeInterval on the ESP32-C3
+(little-endian, RISC-V).
 
 Usage:
     # Single file with specific presets
@@ -33,6 +34,7 @@ import argparse
 from collections import namedtuple
 
 from cpfont_version import CPFONT_VERSION
+from raster_utils import pack_freetype_mono
 
 # --- Unicode interval presets ---
 
@@ -138,6 +140,8 @@ StyleRasterData = namedtuple("StyleRasterData", [
     "intervals",               # validated intervals [(start, end), ...]
     "all_glyphs",              # [(GlyphProps, packed_bytes), ...]
     "total_bitmap_size",       # int
+    "mono_glyphs",             # independently rasterized [(GlyphProps, bytes), ...]
+    "mono_bitmap_size",        # int
     "advanceY", "ascender", "descender",
     "kern_left_classes", "kern_right_classes", "kern_matrix",
     "kern_left_class_count", "kern_right_class_count",
@@ -589,17 +593,22 @@ def rasterize_font_style(fontfile, size, intervals, style_id=0, force_autohint=F
     if force_autohint:
         load_flags |= freetype.FT_LOAD_FORCE_AUTOHINT
 
-    def load_glyph(code_point):
+    mono_load_flags = (freetype.FT_LOAD_RENDER | freetype.FT_LOAD_TARGET_MONO |
+                       freetype.FT_LOAD_MONOCHROME)
+    if force_autohint:
+        mono_load_flags |= freetype.FT_LOAD_FORCE_AUTOHINT
+
+    def load_glyph(code_point, flags=load_flags):
         glyph_index = face.get_char_index(code_point)
         if glyph_index == 0:
             glyph_index = ligature_glyph_indices.get(code_point, 0)
         if glyph_index > 0:
-            face.load_glyph(glyph_index, load_flags)
+            face.load_glyph(glyph_index, flags)
             return face
         if fallback_face:
             fallback_glyph_index = fallback_face.get_char_index(code_point)
             if fallback_glyph_index > 0:
-                fallback_face.load_glyph(fallback_glyph_index, load_flags)
+                fallback_face.load_glyph(fallback_glyph_index, flags)
                 return fallback_face
         return None
 
@@ -628,6 +637,8 @@ def rasterize_font_style(fontfile, size, intervals, style_id=0, force_autohint=F
     # Rasterize all glyphs
     total_bitmap_size = 0
     all_glyphs = []
+    mono_bitmap_size = 0
+    mono_glyphs = []
 
     for i_start, i_end in intervals:
         for code_point in range(i_start, i_end + 1):
@@ -635,6 +646,7 @@ def rasterize_font_style(fontfile, size, intervals, style_id=0, force_autohint=F
             if f is None:
                 glyph = GlyphProps(0, 0, 0, 0, 0, 0, total_bitmap_size, code_point)
                 all_glyphs.append((glyph, b''))
+                mono_glyphs.append((GlyphProps(0, 0, 0, 0, 0, 0, mono_bitmap_size, code_point), b''))
                 continue
 
             bitmap = f.glyph.bitmap
@@ -712,6 +724,27 @@ def rasterize_font_style(fontfile, size, intervals, style_id=0, force_autohint=F
             total_bitmap_size += len(packed)
             all_glyphs.append((glyph, packed))
 
+            # Rasterize the fast-AA glyph independently through FreeType's
+            # monochrome hinter; never threshold the grayscale bitmap above.
+            mono_face = load_glyph(code_point, mono_load_flags)
+            mono_bitmap = mono_face.glyph.bitmap
+            mono_packed = pack_freetype_mono(mono_bitmap, freetype.FT_PIXEL_MODE_MONO)
+            mono_has_ink = any(mono_packed)
+            mono_glyph = GlyphProps(
+                width=mono_bitmap.width if mono_has_ink else 0,
+                height=mono_bitmap.rows if mono_has_ink else 0,
+                advance_x=glyph.advance_x,
+                left=mono_face.glyph.bitmap_left if mono_has_ink else 0,
+                top=mono_face.glyph.bitmap_top if mono_has_ink else 0,
+                data_length=len(mono_packed) if mono_has_ink else 0,
+                data_offset=mono_bitmap_size,
+                code_point=code_point,
+            )
+            if not mono_has_ink:
+                mono_packed = b""
+            mono_bitmap_size += len(mono_packed)
+            mono_glyphs.append((mono_glyph, mono_packed))
+
     # Get font metrics from pipe character (same heuristic as fontconvert.py)
     load_glyph(ord('|'))
 
@@ -721,6 +754,8 @@ def rasterize_font_style(fontfile, size, intervals, style_id=0, force_autohint=F
 
     print(f"  [{style_label}] Metrics: advanceY={advanceY}, ascender={ascender}, descender={descender}", file=sys.stderr)
     print(f"  [{style_label}] Bitmap: {total_bitmap_size} bytes ({total_bitmap_size / 1024:.1f} KB)", file=sys.stderr)
+    print(f"  [{style_label}] Mono bitmap: {mono_bitmap_size} bytes ({mono_bitmap_size / 1024:.1f} KB)",
+          file=sys.stderr)
 
     # --- Extract kerning and ligatures ---
     ppem = size * 150.0 / 72.0
@@ -757,6 +792,8 @@ def rasterize_font_style(fontfile, size, intervals, style_id=0, force_autohint=F
         intervals=intervals,
         all_glyphs=all_glyphs,
         total_bitmap_size=total_bitmap_size,
+        mono_glyphs=mono_glyphs,
+        mono_bitmap_size=mono_bitmap_size,
         advanceY=advanceY,
         ascender=ascender,
         descender=descender,
@@ -778,7 +815,7 @@ assert struct.calcsize(GLYPH_STRUCT_FORMAT) == 16
 
 def pack_style_sections(sd):
     """Pack one StyleRasterData into binary section bytearrays.
-    Returns (intervals_data, glyphs_data, kern_left, kern_right, kern_matrix, ligatures, bitmaps)."""
+    Returns the existing shared/2-bit sections followed by mono glyphs and bitmaps."""
     intervals_data = bytearray()
     offset = 0
     for i_start, i_end in sd.intervals:
@@ -813,8 +850,20 @@ def pack_style_sections(sd):
         bitmap_data += packed
     assert len(bitmap_data) == sd.total_bitmap_size
 
+    mono_glyphs_data = bytearray()
+    mono_bitmap_data = bytearray()
+    for glyph, packed in sd.mono_glyphs:
+        mono_glyphs_data += struct.pack(GLYPH_STRUCT_FORMAT,
+                                        glyph.width, glyph.height, glyph.advance_x,
+                                        glyph.left, glyph.top,
+                                        glyph.data_length, glyph.data_offset)
+        mono_bitmap_data += packed
+    assert len(sd.mono_glyphs) == len(sd.all_glyphs)
+    assert len(mono_bitmap_data) == sd.mono_bitmap_size
+
     return (intervals_data, glyphs_data, kern_left_data, kern_right_data,
-            kern_matrix_data, ligature_data, bitmap_data)
+            kern_matrix_data, ligature_data, bitmap_data,
+            mono_glyphs_data, mono_bitmap_data)
 
 
 def style_sections_total_size(sections):
@@ -826,7 +875,7 @@ def style_sections_total_size(sections):
 
 def generate_cpfont_multistyle(style_fonts, size, intervals, output_path,
                                force_autohint=False, fallback_style_fonts=None):
-    """Generate a multi-style v4 .cpfont file.
+    """Generate a multi-style v5 dual-raster .cpfont file.
 
     style_fonts: dict of {style_id: fontfile_path} e.g. {0: "Regular.ttf", 2: "Italic.ttf"}
     fallback_style_fonts: optional dict of {style_id: fallback_fontfile_path}
@@ -834,7 +883,7 @@ def generate_cpfont_multistyle(style_fonts, size, intervals, output_path,
     MAGIC = b"CPFONT\x00\x00"
     HEADER_SIZE = 32
     STYLE_TOC_ENTRY_SIZE = 32
-    flags = 1  # always 2-bit greyscale
+    flags = 3  # primary 2-bit greyscale + dedicated monochrome variant
     style_count = len(style_fonts)
 
     # Rasterize each style
@@ -859,20 +908,22 @@ def generate_cpfont_multistyle(style_fonts, size, intervals, output_path,
     current_offset = data_start
 
     style_offsets = {}  # style_id -> absolute file offset
+    mono_offsets = {}   # style_id -> absolute mono EpdGlyph block offset
     for style_id in sorted(packed_sections.keys()):
         style_offsets[style_id] = current_offset
+        mono_offsets[style_id] = current_offset + sum(len(s) for s in packed_sections[style_id][:7])
         current_offset += style_sections_total_size(packed_sections[style_id])
 
     # Build global header
-    # V4 header: magic(8) + version(2) + flags(2) + styleCount(1) + reserved(19) = 32
+    # V5 header: magic(8) + version(2) + flags(2) + styleCount(1) + reserved(19) = 32
     header = struct.pack("<8sHHB19s", MAGIC, CPFONT_VERSION, flags, style_count, bytes(19))
     assert len(header) == HEADER_SIZE
 
     # Build style TOC entries
     # Each entry: styleId(1) + pad(3) + intervalCount(4) + glyphCount(4) +
     #   advanceY(1) + ascender(2) + descender(2) + kernL(2) + kernR(2) +
-    #   kernLCls(1) + kernRCls(1) + ligCount(1) + dataOffset(4) + reserved(4) = 32
-    STYLE_TOC_FORMAT = "<B3xIIBhhHHBBBI4x"
+    #   kernLCls(1) + kernRCls(1) + ligCount(1) + dataOffset(4) + monoGlyphOffset(4) = 32
+    STYLE_TOC_FORMAT = "<B3xIIBhhHHBBBII"
     assert struct.calcsize(STYLE_TOC_FORMAT) == STYLE_TOC_ENTRY_SIZE
 
     toc_data = bytearray()
@@ -891,7 +942,7 @@ def generate_cpfont_multistyle(style_fonts, size, intervals, output_path,
                                 len(sd.kern_left_classes), len(sd.kern_right_classes),
                                 sd.kern_left_class_count, sd.kern_right_class_count,
                                 len(sd.ligature_pairs),
-                                style_offsets[style_id])
+                                style_offsets[style_id], mono_offsets[style_id])
 
     # Write output
     os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else ".", exist_ok=True)
@@ -905,7 +956,7 @@ def generate_cpfont_multistyle(style_fonts, size, intervals, output_path,
         total_file_size = f.tell()
 
     # Print summary
-    print(f"  Output: {output_path} (v4, {style_count} styles)", file=sys.stderr)
+    print(f"  Output: {output_path} (v{CPFONT_VERSION}, {style_count} styles, dual raster)", file=sys.stderr)
     print(f"    Header+TOC: {HEADER_SIZE + len(toc_data)} bytes", file=sys.stderr)
     for style_id in sorted(raster_data.keys()):
         sd = raster_data[style_id]
@@ -949,9 +1000,9 @@ def main():
     parser.add_argument("--list-presets", action="store_true",
                         help="List available interval presets and exit.")
 
-    # Multi-style mode: per-style font file arguments (generates v4 .cpfont)
+    # Multi-style mode: per-style font file arguments
     parser.add_argument("--regular", dest="font_regular",
-                        help="Font file for regular style (enables multi-style v4 mode).")
+                        help="Font file for regular style (enables multi-style mode).")
     parser.add_argument("--bold", dest="font_bold",
                         help="Font file for bold style.")
     parser.add_argument("--italic", dest="font_italic",
@@ -1045,11 +1096,10 @@ def main():
         font_name = base
 
     if not is_multistyle:
-        # Single font file provided: wrap as a single-style v4 font
+        # Single font file provided: wrap as a single-style font
         style_map = {"regular": 0, "bold": 1, "italic": 2, "bolditalic": 3}
         style_fonts[style_map[args.style]] = fontfile
 
-    # Always generate v4 format
     if args.output and len(sizes) != 1:
         print("Error: --output can only be used with a single size", file=sys.stderr)
         sys.exit(1)
@@ -1061,7 +1111,7 @@ def main():
         else:
             filename = f"{font_name}_{sz}.cpfont"
             output_path = os.path.join(output_dir, filename)
-        print(f"Generating {output_path} (size {sz}, {len(style_fonts)} style(s), v4)...", file=sys.stderr)
+        print(f"Generating {output_path} (size {sz}, {len(style_fonts)} style(s), v{CPFONT_VERSION})...", file=sys.stderr)
         total_size += generate_cpfont_multistyle(
             style_fonts, sz, intervals, output_path,
             force_autohint=args.force_autohint,

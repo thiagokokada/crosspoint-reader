@@ -21,12 +21,15 @@ parser.add_argument("fontstack", action="store", nargs='+', help="list of font f
 parser.add_argument("--2bit", dest="is2Bit", action="store_true", help="generate 2-bit greyscale bitmap instead of 1-bit black and white.")
 parser.add_argument("--additional-intervals", dest="additional_intervals", action="append", help="Additional code point intervals to export as min,max. This argument can be repeated.")
 parser.add_argument("--compress", dest="compress", action="store_true", help="Compress glyph bitmaps using DEFLATE with group-based compression.")
+parser.add_argument("--dual-raster", dest="dual_raster", action="store_true",
+                    help="also emit an independently hinted monochrome variant for fast AA")
 parser.add_argument("--force-autohint", dest="force_autohint", action="store_true", help="Force FreeType auto-hinter instead of native font hinting. Improves stem width consistency for fonts with weak or no native TrueType hints.")
 parser.add_argument("--pnum", dest="pnum", action="store_true", help="Use proportional numerals (pnum OpenType feature) instead of default tabular figures. Reduces visual gaps between digits in running prose.")
 args = parser.parse_args()
 
 import freetype
 from fontTools.ttLib import TTFont
+from raster_utils import pack_freetype_mono
 
 GlyphProps = namedtuple("GlyphProps", ["width", "height", "advance_x", "left", "top", "data_length", "data_offset", "code_point"])
 
@@ -37,6 +40,11 @@ font_name = args.name
 load_flags = freetype.FT_LOAD_RENDER
 if args.force_autohint:
     load_flags |= freetype.FT_LOAD_FORCE_AUTOHINT
+mono_load_flags = freetype.FT_LOAD_RENDER | freetype.FT_LOAD_TARGET_MONO | freetype.FT_LOAD_MONOCHROME
+if args.force_autohint:
+    mono_load_flags |= freetype.FT_LOAD_FORCE_AUTOHINT
+if args.dual_raster and not args.is2Bit:
+    parser.error("--dual-raster requires --2bit")
 
 # inclusive unicode code point intervals
 # must not overlap and be in ascending order
@@ -231,7 +239,7 @@ if args.pnum:
         if count > 0:
             print(f"pnum: {count} glyph substitutions from {font_path}", file=sys.stderr)
 
-def load_glyph(code_point):
+def load_glyph(code_point, flags=load_flags):
     face_index = 0
     while face_index < len(font_stack):
         face = font_stack[face_index]
@@ -239,7 +247,7 @@ def load_glyph(code_point):
         if glyph_index is None:
             glyph_index = face.get_char_index(code_point)
         if glyph_index > 0:
-            face.load_glyph(glyph_index, load_flags)
+            face.load_glyph(glyph_index, flags)
             return face
         face_index += 1
     return None
@@ -248,7 +256,11 @@ unmerged_intervals = sorted(intervals + add_ints)
 intervals = []
 unvalidated_intervals = []
 for i_start, i_end in unmerged_intervals:
-    if len(unvalidated_intervals) > 0 and i_start <= unvalidated_intervals[-1][1] + 1:
+    # Dual-raster regeneration must preserve the existing primary interval
+    # boundaries byte-for-byte. Merge overlaps, but retain adjacent source
+    # ranges as distinct entries just as the checked-in reader fonts do.
+    merge_limit = unvalidated_intervals[-1][1] + (0 if args.dual_raster else 1) if unvalidated_intervals else -1
+    if unvalidated_intervals and i_start <= merge_limit:
         unvalidated_intervals[-1] = (unvalidated_intervals[-1][0], max(unvalidated_intervals[-1][1], i_end))
         continue
     unvalidated_intervals.append((i_start, i_end))
@@ -269,6 +281,8 @@ for face in font_stack:
 
 total_size = 0
 all_glyphs = []
+mono_total_size = 0
+mono_all_glyphs = []
 
 for i_start, i_end in intervals:
     for code_point in range(i_start, i_end + 1):
@@ -374,6 +388,26 @@ for i_start, i_end in intervals:
         total_size += len(packed)
         all_glyphs.append((glyph, packed))
 
+        if args.dual_raster:
+            mono_face = load_glyph(code_point, mono_load_flags)
+            mono_bitmap = mono_face.glyph.bitmap
+            mono_packed = pack_freetype_mono(mono_bitmap, freetype.FT_PIXEL_MODE_MONO)
+            mono_has_ink = any(mono_packed)
+            mono_glyph = GlyphProps(
+                width=mono_bitmap.width if mono_has_ink else 0,
+                height=mono_bitmap.rows if mono_has_ink else 0,
+                advance_x=glyph.advance_x,
+                left=mono_face.glyph.bitmap_left if mono_has_ink else 0,
+                top=mono_face.glyph.bitmap_top if mono_has_ink else 0,
+                data_length=len(mono_packed) if mono_has_ink else 0,
+                data_offset=mono_total_size,
+                code_point=code_point,
+            )
+            if not mono_has_ink:
+                mono_packed = b""
+            mono_total_size += len(mono_packed)
+            mono_all_glyphs.append((mono_glyph, mono_packed))
+
 # pipe seems to be a good heuristic for the "real" descender
 face = load_glyph(ord('|'))
 
@@ -383,6 +417,12 @@ for index, glyph in enumerate(all_glyphs):
     props, packed = glyph
     glyph_data.extend([b for b in packed])
     glyph_props.append(props)
+
+mono_glyph_data = []
+mono_glyph_props = []
+for props, packed in mono_all_glyphs:
+    mono_glyph_data.extend(packed)
+    mono_glyph_props.append(props)
 
 # --- Kerning pair extraction ---
 # Modern fonts store kerning in the OpenType GPOS table, which FreeType's
@@ -790,6 +830,20 @@ def to_byte_aligned(packed, width, height):
     return bytes(aligned)
 
 
+def mono_to_byte_aligned(packed, width, height):
+    """Convert a continuous packed 1-bit glyph to MSB-first row-aligned bytes."""
+    if width == 0 or height == 0:
+        return b''
+    row_stride = (width + 7) // 8
+    aligned = bytearray(row_stride * height)
+    for y in range(height):
+        for x in range(width):
+            packed_pos = y * width + x
+            bit = (packed[packed_pos // 8] >> (7 - packed_pos % 8)) & 1
+            aligned[y * row_stride + x // 8] |= bit << (7 - x % 8)
+    return bytes(aligned)
+
+
 # Build groups for compression
 if compress and not is2Bit:
     print("Error: --compress requires --2bit (byte-aligned compression only supports 2-bit format)", file=sys.stderr)
@@ -915,11 +969,42 @@ if compress:
     total_uncompressed = len(glyph_data)
     print(f"// Compression: {total_uncompressed} -> {total_compressed} bytes ({100*total_compressed/total_uncompressed:.1f}%), {len(groups)} groups", file=sys.stderr)
 
+mono_compressed_groups = []
+mono_compressed_bitmap_data = []
+if args.dual_raster and compress:
+    modified_mono_props = list(mono_glyph_props)
+    for first_idx, count in groups:
+        packed_len = 0
+        group_aligned = bytearray()
+        for gi in range(first_idx, first_idx + count):
+            props, packed = mono_all_glyphs[gi]
+            old_props = modified_mono_props[gi]
+            modified_mono_props[gi] = GlyphProps(
+                width=old_props.width,
+                height=old_props.height,
+                advance_x=old_props.advance_x,
+                left=old_props.left,
+                top=old_props.top,
+                data_length=old_props.data_length,
+                data_offset=packed_len,
+                code_point=old_props.code_point,
+            )
+            packed_len += len(packed)
+            group_aligned.extend(mono_to_byte_aligned(packed, props.width, props.height))
+        compressor = zlib.compressobj(level=9, wbits=-15)
+        compressed = compressor.compress(bytes(group_aligned)) + compressor.flush()
+        mono_compressed_groups.append((compressed, len(group_aligned), count, first_idx))
+        mono_compressed_bitmap_data.extend(compressed)
+    mono_glyph_props = modified_mono_props
+    print(f"// Mono compression: {len(mono_glyph_data)} -> {len(mono_compressed_bitmap_data)} bytes "
+          f"({100*len(mono_compressed_bitmap_data)/max(1, len(mono_glyph_data)):.1f}%), {len(groups)} groups",
+          file=sys.stderr)
+
 print(f"""/**
  * generated by fontconvert.py
  * name: {font_name}
  * size: {size}
- * mode: {'2-bit' if is2Bit else '1-bit'}{'  compressed: true' if compress else ''}
+ * mode: {'2-bit + dedicated mono' if args.dual_raster else ('2-bit' if is2Bit else '1-bit')}{'  compressed: true' if compress else ''}
  * Command used: {' '.join(sys.argv)}
  */
 #pragma once
@@ -937,6 +1022,13 @@ else:
         print ("    " + " ".join(f"0x{b:02X}," for b in c))
     print ("};\n");
 
+if args.dual_raster:
+    mono_bitmap_output = mono_compressed_bitmap_data if compress else mono_glyph_data
+    print(f"static const uint8_t {font_name}MonoBitmaps[{len(mono_bitmap_output)}] = {{")
+    for c in chunks(mono_bitmap_output, 16):
+        print("    " + " ".join(f"0x{b:02X}," for b in c))
+    print("};")
+
 def cp_label(cp):
     if cp == 0x5C:
         return '<backslash>'
@@ -946,6 +1038,14 @@ print(f"static const EpdGlyph {font_name}Glyphs[] = {{")
 for i, g in enumerate(glyph_props):
     print ("    { " + ", ".join([f"{a}" for a in list(g[:-1])]),"},", f"// {cp_label(g.code_point)}")
 print ("};\n");
+
+if args.dual_raster:
+    print(f"static const EpdCompactGlyph {font_name}MonoGlyphs[] = {{")
+    for g in mono_glyph_props:
+        if not (-128 <= g.left <= 127 and -128 <= g.top <= 127 and g.data_length <= 255):
+            raise ValueError(f"mono glyph U+{g.code_point:04X} does not fit EpdCompactGlyph")
+        print(f"    {{ {g.width}, {g.height}, {g.left}, {g.top}, {g.data_length} }}, // {cp_label(g.code_point)}")
+    print("};\n")
 
 print(f"static const EpdUnicodeInterval {font_name}Intervals[] = {{")
 offset = 0
@@ -961,6 +1061,13 @@ if compress:
         print(f"    {{ {compressed_offset}, {len(compressed)}, {uncompressed_size}, {count}, {first_idx} }},")
         compressed_offset += len(compressed)
     print("};\n")
+    if args.dual_raster:
+        print(f"static const EpdFontGroup {font_name}MonoGroups[] = {{")
+        compressed_offset = 0
+        for compressed, uncompressed_size, count, first_idx in mono_compressed_groups:
+            print(f"    {{ {compressed_offset}, {len(compressed)}, {uncompressed_size}, {count}, {first_idx} }},")
+            compressed_offset += len(compressed)
+        print("};\n")
 
 if kern_map:
     print(f"static const EpdKernClassEntry {font_name}KernLeftClasses[] = {{")
@@ -986,43 +1093,59 @@ if ligature_pairs:
         print(f"    {{ 0x{packed_pair:08X}, 0x{lig_cp:04X} }}, // {cp_label(packed_pair >> 16)} {cp_label(packed_pair & 0xFFFF)} -> {cp_label(lig_cp)}")
     print("};\n")
 
-print(f"static const EpdFontData {font_name} = {{")
-print(f"    {font_name}Bitmaps,")
-print(f"    {font_name}Glyphs,")
-print(f"    {font_name}Intervals,")
-print(f"    {len(intervals)},")
-print(f"    {norm_ceil(face.size.height)},")
-print(f"    {norm_ceil(face.size.ascender)},")
-print(f"    {norm_floor(face.size.descender)},")
-print(f"    {'true' if is2Bit else 'false'},")
-if compress:
-    print(f"    {font_name}Groups,")
-    print(f"    {len(compressed_groups)},")
-else:
-    print("    nullptr,")
-    print("    0,")
-# glyphToGroup (not used for script-grouped fonts)
-print("    nullptr,")
-if kern_map:
-    print(f"    {font_name}KernLeftClasses,")
-    print(f"    {font_name}KernRightClasses,")
-    print(f"    {font_name}KernMatrix,")
-    print(f"    {len(kern_left_classes)},")
-    print(f"    {len(kern_right_classes)},")
-    print(f"    {kern_left_class_count},")
-    print(f"    {kern_right_class_count},")
-else:
-    print(f"    nullptr,")
-    print(f"    nullptr,")
-    print(f"    nullptr,")
-    print(f"    0,")
-    print(f"    0,")
-    print(f"    0,")
-    print(f"    0,")
-if ligature_pairs:
-    print(f"    {font_name}LigaturePairs,")
-    print(f"    {len(ligature_pairs)},")
-else:
-    print(f"    nullptr,")
-    print(f"    0,")
-print("};")
+def emit_font_data(symbol, bitmap_symbol, glyph_symbol, group_symbol, group_count,
+                   two_bit, compact_glyph, layout_glyph, mono_variant):
+    print(f"static const EpdFontData {symbol} = {{")
+    print(f"    {bitmap_symbol},")
+    print(f"    {glyph_symbol},")
+    print(f"    {font_name}Intervals,")
+    print(f"    {len(intervals)},")
+    print(f"    {norm_ceil(face.size.height)},")
+    print(f"    {norm_ceil(face.size.ascender)},")
+    print(f"    {norm_floor(face.size.descender)},")
+    print(f"    {'true' if two_bit else 'false'},")
+    if compress:
+        print(f"    {group_symbol},")
+        print(f"    {group_count},")
+    else:
+        print("    nullptr,")
+        print("    0,")
+    print("    nullptr,")  # glyphToGroup
+    if kern_map:
+        print(f"    {font_name}KernLeftClasses,")
+        print(f"    {font_name}KernRightClasses,")
+        print(f"    {font_name}KernMatrix,")
+        print(f"    {len(kern_left_classes)},")
+        print(f"    {len(kern_right_classes)},")
+        print(f"    {kern_left_class_count},")
+        print(f"    {kern_right_class_count},")
+    else:
+        print("    nullptr,\n    nullptr,\n    nullptr,\n    0,\n    0,\n    0,\n    0,")
+    if ligature_pairs:
+        print(f"    {font_name}LigaturePairs,")
+        print(f"    {len(ligature_pairs)},")
+    else:
+        print("    nullptr,\n    0,")
+    # Preserve the historical aggregate initializer for UI-only fonts. The
+    # newly-added callback and mono fields are value-initialized to nullptr.
+    if not args.dual_raster:
+        print("};")
+        return
+    print("    nullptr,")  # glyphMissHandler
+    print("    nullptr,")  # glyphMissCtx
+    print("    nullptr,")  # coverageHandler
+    print(f"    {compact_glyph},")
+    print(f"    {layout_glyph},")
+    print(f"    {mono_variant},")
+    print("};")
+
+
+if args.dual_raster:
+    emit_font_data(f"{font_name}Mono", f"{font_name}MonoBitmaps", "nullptr",
+                   f"{font_name}MonoGroups", len(mono_compressed_groups), False,
+                   f"{font_name}MonoGlyphs", f"{font_name}Glyphs", "nullptr")
+    print()
+
+emit_font_data(font_name, f"{font_name}Bitmaps", f"{font_name}Glyphs",
+               f"{font_name}Groups", len(compressed_groups) if compress else 0, is2Bit,
+               "nullptr", "nullptr", f"&{font_name}Mono" if args.dual_raster else "nullptr")
