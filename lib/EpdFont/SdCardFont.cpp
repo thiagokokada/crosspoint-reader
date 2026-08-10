@@ -111,6 +111,7 @@ void SdCardFont::freeStyleMiniData(PerStyle& s) {
   freeStyleMiniKern(s);
   memset(&s.miniData, 0, sizeof(s.miniData));
   s.epdFont.data = &s.stubData;
+  s.epdFont.clearPreparedData();
 }
 
 void SdCardFont::resetStyleMiniData(PerStyle& s) {
@@ -194,6 +195,7 @@ void SdCardFont::freeAll() {
   styleCount_ = 0;
   contentHash_ = 0;
   loaded_ = false;
+  fileVersion_ = 0;
 }
 
 void SdCardFont::clearOverflow() {
@@ -478,6 +480,11 @@ void SdCardFont::applyGlyphMissCallback(uint8_t styleIdx) {
   s.stubData.glyphMissHandler = &SdCardFont::onGlyphMiss;
   s.stubData.glyphMissCtx = &overflowCtx_[styleIdx];
   s.stubData.coverageHandler = &SdCardFont::onCoverageQuery;
+  if (s.header.hasMono) {
+    s.stubMonoData.glyphMissHandler = &SdCardFont::onGlyphMiss;
+    s.stubMonoData.glyphMissCtx = &overflowCtx_[styleIdx];
+    s.stubMonoData.coverageHandler = &SdCardFont::onCoverageQuery;
+  }
 }
 
 bool SdCardFont::onCoverageQuery(void* ctx, const uint32_t codepoint) {
@@ -530,15 +537,23 @@ bool SdCardFont::load(const char* path) {
   }
 
   uint16_t fileVersion = readU16(headerBuf + 8);
-  if (fileVersion != CPFONT_VERSION) {
-    LOG_ERR("SDCF", "Unsupported version: %u (expected %u)", fileVersion, CPFONT_VERSION);
+  if (fileVersion < CPFONT_MIN_SUPPORTED_VERSION || fileVersion > CPFONT_VERSION) {
+    LOG_ERR("SDCF", "Unsupported version: %u (supported %u-%u)", fileVersion, CPFONT_MIN_SUPPORTED_VERSION,
+            CPFONT_VERSION);
     return false;
   }
+  fileVersion_ = fileVersion;
 
   // Begin content hash: accumulate global header
   uint32_t hash = fnv1a(headerBuf, HEADER_SIZE);
 
-  bool is2Bit = (readU16(headerBuf + 10) & 1) != 0;
+  const uint16_t flags = readU16(headerBuf + 10);
+  bool is2Bit = (flags & 1) != 0;
+  const bool hasMono = fileVersion >= 5 && (flags & 2) != 0;
+  if (fileVersion == 4 && (flags & 2) != 0) {
+    LOG_ERR("SDCF", "v4 font uses unsupported dual-raster flag");
+    return false;
+  }
 
   uint8_t styleCount = headerBuf[12];
   if (styleCount == 0 || styleCount > MAX_STYLES) {
@@ -579,6 +594,7 @@ bool SdCardFont::load(const char* path) {
     s.header.kernRightClassCount = tocBuf[22];
     s.header.ligaturePairCount = tocBuf[23];
     s.header.is2Bit = is2Bit;
+    s.header.hasMono = hasMono;
 
     // Sanity-check counts to reject malformed files before allocating.
     // Kern class counts are uint8 (bounded by type). Entry counts are uint16
@@ -597,10 +613,67 @@ bool SdCardFont::load(const char* path) {
 
     uint32_t dataOffset = readU32(tocBuf + 24);
     computeStyleFileOffsets(s, dataOffset);
+    if (hasMono) {
+      s.monoGlyphsFileOffset = readU32(tocBuf + 28);
+      s.monoBitmapFileOffset = s.monoGlyphsFileOffset + s.header.glyphCount * sizeof(EpdGlyph);
+    }
   }
 
   styleCount_ = styleCount;
   contentHash_ = hash;
+
+  // v5 mono blocks contain one EpdGlyph per primary glyph followed by a
+  // continuous 1-bit bitmap stream. Validate every offset and packed length
+  // before any render-time SD read trusts the metadata.
+  if (hasMono) {
+    const uint64_t fileSize = file.fileSize64();
+    for (uint8_t si = 0; si < MAX_STYLES; ++si) {
+      auto& s = styles_[si];
+      if (!s.present) continue;
+
+      uint64_t styleEnd = fileSize;
+      for (uint8_t other = 0; other < MAX_STYLES; ++other) {
+        if (styles_[other].present && styles_[other].intervalsFileOffset > s.intervalsFileOffset) {
+          styleEnd = std::min<uint64_t>(styleEnd, styles_[other].intervalsFileOffset);
+        }
+      }
+      const uint64_t glyphBytes = static_cast<uint64_t>(s.header.glyphCount) * sizeof(EpdGlyph);
+      if (s.monoGlyphsFileOffset < s.bitmapFileOffset ||
+          static_cast<uint64_t>(s.monoGlyphsFileOffset) + glyphBytes > styleEnd) {
+        LOG_ERR("SDCF", "Style %u: invalid mono block offset", si);
+        freeAll();
+        return false;
+      }
+      if (!file.seekSet(s.monoGlyphsFileOffset)) {
+        LOG_ERR("SDCF", "Style %u: failed to seek to mono glyphs", si);
+        freeAll();
+        return false;
+      }
+      uint32_t expectedBitmapOffset = 0;
+      EpdGlyph monoGlyph{};
+      for (uint32_t gi = 0; gi < s.header.glyphCount; ++gi) {
+        if (file.read(reinterpret_cast<uint8_t*>(&monoGlyph), sizeof(monoGlyph)) != sizeof(monoGlyph)) {
+          LOG_ERR("SDCF", "Style %u: truncated mono glyph metadata at %u", si, gi);
+          freeAll();
+          return false;
+        }
+        const uint32_t expectedLength = (static_cast<uint32_t>(monoGlyph.width) * monoGlyph.height + 7) / 8;
+        if (monoGlyph.dataLength != expectedLength || monoGlyph.dataOffset != expectedBitmapOffset ||
+            expectedBitmapOffset > UINT32_MAX - expectedLength) {
+          LOG_ERR("SDCF", "Style %u: malformed mono glyph %u (len=%u/%u off=%u/%u)", si, gi, monoGlyph.dataLength,
+                  expectedLength, monoGlyph.dataOffset, expectedBitmapOffset);
+          freeAll();
+          return false;
+        }
+        expectedBitmapOffset += expectedLength;
+      }
+      if (static_cast<uint64_t>(s.monoBitmapFileOffset) + expectedBitmapOffset > styleEnd) {
+        LOG_ERR("SDCF", "Style %u: mono bitmap block extends past style boundary", si);
+        freeAll();
+        return false;
+      }
+    }
+  }
 
   // Load full intervals into RAM for each present style. BMP-only fonts with
   // fewer than 65536 glyphs use a compact 6-byte interval table instead of the
@@ -700,13 +773,24 @@ bool SdCardFont::load(const char* path) {
     s.stubData.descender = s.header.descender;
     s.stubData.is2Bit = s.header.is2Bit;
 
+    if (s.header.hasMono) {
+      // The mono stub provides the correct decoder depth for on-demand glyphs;
+      // all lookup callbacks and shared metrics remain identical.
+      memset(&s.stubMonoData, 0, sizeof(s.stubMonoData));
+      s.stubMonoData.advanceY = s.header.advanceY;
+      s.stubMonoData.ascender = s.header.ascender;
+      s.stubMonoData.descender = s.header.descender;
+      s.stubMonoData.is2Bit = false;
+      s.stubData.monoVariant = &s.stubMonoData;
+    }
+
     s.epdFont.data = &s.stubData;
     applyGlyphMissCallback(i);
   }
 
   loaded_ = true;
 
-  LOG_DBG("SDCF", "Loaded: %s (v%u, %u styles)", path, CPFONT_VERSION, styleCount_);
+  LOG_DBG("SDCF", "Loaded: %s (v%u, %u styles)", path, fileVersion_, styleCount_);
   for (uint8_t i = 0; i < MAX_STYLES; i++) {
     if (!styles_[i].present) continue;
     const auto& h = styles_[i].header;
@@ -846,13 +930,17 @@ int SdCardFont::prewarm(const char* utf8Text, uint8_t styleMask, bool metadataOn
 
 int SdCardFont::prewarmStyle(uint8_t styleIdx, const uint32_t* codepoints, uint32_t cpCount, bool metadataOnly) {
   auto& s = styles_[styleIdx];
+  const FontRasterMode requestedMode = s.epdFont.getRasterMode();
+  const FontRasterMode rasterMode =
+      (requestedMode == FontRasterMode::Mono && s.header.hasMono) ? FontRasterMode::Mono : FontRasterMode::Primary;
+  const bool useMono = rasterMode == FontRasterMode::Mono;
 
   // Idle-prewarm hit: mini data persists across PrewarmScopes (resetStyleMiniData
   // keeps it), so when the previous scope -- typically the idle prewarm of this
   // exact page -- already loaded every requested codepoint the font covers, this
   // page needs zero SD reads. A mini built metadata-only cannot serve a full
   // request (no bitmaps). Any uncovered codepoint falls through to the rebuild.
-  if (s.miniGlyphCount > 0 && !(s.miniMetadataOnly && !metadataOnly)) {
+  if (s.miniGlyphCount > 0 && s.miniRasterMode == rasterMode && !(s.miniMetadataOnly && !metadataOnly)) {
     bool covered = true;
     int missedInMini = 0;
     for (uint32_t i = 0; i < cpCount && covered; i++) {
@@ -873,6 +961,9 @@ int SdCardFont::prewarmStyle(uint8_t styleIdx, const uint32_t* codepoints, uint3
       }
     }
     if (covered) {
+      // Tag with the requested mode even when a legacy v4 font maps Mono to
+      // its primary raster, otherwise EpdFont rejects the prepared fallback.
+      s.epdFont.setPreparedData(&s.miniData, requestedMode);
       return missedInMini;
     }
   }
@@ -902,7 +993,7 @@ int SdCardFont::prewarmStyle(uint8_t styleIdx, const uint32_t* codepoints, uint3
   if (validCount == 0) {
     freeStyleMiniData(s);
     delete[] mappings;
-    s.epdFont.data = &s.stubData;
+    s.epdFont.clearPreparedData();
     return missed;
   }
 
@@ -916,7 +1007,7 @@ int SdCardFont::prewarmStyle(uint8_t styleIdx, const uint32_t* codepoints, uint3
   s.miniKernLeftClassCount = 0;
   s.miniKernRightClassCount = 0;
   memset(&s.miniData, 0, sizeof(s.miniData));
-  s.epdFont.data = &s.stubData;
+  s.epdFont.clearPreparedData();
 
   if (!ensureArrayCapacity(s.miniIntervals, s.miniIntervalCapacity, validCount)) {
     LOG_ERR("SDCF", "Failed to allocate mini intervals for style %u", styleIdx);
@@ -980,7 +1071,8 @@ int SdCardFont::prewarmStyle(uint8_t styleIdx, const uint32_t* codepoints, uint3
     uint32_t mapIdx = readOrder[i];
     int32_t gIdx = mappings[mapIdx].globalIndex;
 
-    uint32_t fileOff = s.glyphsFileOffset + static_cast<uint32_t>(gIdx) * sizeof(EpdGlyph);
+    const uint32_t glyphBase = useMono ? s.monoGlyphsFileOffset : s.glyphsFileOffset;
+    uint32_t fileOff = glyphBase + static_cast<uint32_t>(gIdx) * sizeof(EpdGlyph);
     if (gIdx != lastReadIndex + 1) {
       if (!file.seekSet(fileOff)) {
         LOG_ERR("SDCF", "Prewarm: failed to seek to glyph %d (style %u)", gIdx, styleIdx);
@@ -1034,7 +1126,8 @@ int SdCardFont::prewarmStyle(uint8_t styleIdx, const uint32_t* codepoints, uint3
         continue;
       }
 
-      uint32_t fileOff = s.bitmapFileOffset + glyph.dataOffset;
+      const uint32_t bitmapBase = useMono ? s.monoBitmapFileOffset : s.bitmapFileOffset;
+      uint32_t fileOff = bitmapBase + glyph.dataOffset;
       if (fileOff != lastBitmapEnd) {
         if (!file.seekSet(fileOff)) {
           LOG_ERR("SDCF", "Prewarm: failed to seek to bitmap (style %u)", styleIdx);
@@ -1078,6 +1171,7 @@ int SdCardFont::prewarmStyle(uint8_t styleIdx, const uint32_t* codepoints, uint3
 
   // Populate miniData and swap
   s.miniMetadataOnly = metadataOnly;
+  s.miniRasterMode = rasterMode;
   s.miniHysteresisPending = !metadataOnly;  // one hysteresis evaluation per rebuild
   memset(&s.miniData, 0, sizeof(s.miniData));
   s.miniData.bitmap = s.miniBitmap;
@@ -1087,7 +1181,7 @@ int SdCardFont::prewarmStyle(uint8_t styleIdx, const uint32_t* codepoints, uint3
   s.miniData.advanceY = s.header.advanceY;
   s.miniData.ascender = s.header.ascender;
   s.miniData.descender = s.header.descender;
-  s.miniData.is2Bit = s.header.is2Bit;
+  s.miniData.is2Bit = !useMono && s.header.is2Bit;
   if (kernLigOk) {
     applyKernLigaturePointers(s, s.miniData);
   }
@@ -1095,7 +1189,7 @@ int SdCardFont::prewarmStyle(uint8_t styleIdx, const uint32_t* codepoints, uint3
   s.miniData.glyphMissCtx = &overflowCtx_[styleIdx];
   s.miniData.coverageHandler = &SdCardFont::onCoverageQuery;
 
-  s.epdFont.data = &s.miniData;
+  s.epdFont.setPreparedData(&s.miniData, requestedMode);
 
   // Accumulate stats
   stats_.sdReadTimeMs += sdTime;
@@ -1425,10 +1519,15 @@ const EpdGlyph* SdCardFont::onGlyphMiss(void* ctx, uint32_t codepoint) {
   if (!self->loaded_ || styleIdx >= MAX_STYLES || !self->styles_[styleIdx].present) return nullptr;
   const auto& s = self->styles_[styleIdx];
   if (!s.fullIntervals && !s.bmpIntervals) return nullptr;
+  const FontRasterMode requestedMode = s.epdFont.getRasterMode();
+  const FontRasterMode rasterMode =
+      (requestedMode == FontRasterMode::Mono && s.header.hasMono) ? FontRasterMode::Mono : FontRasterMode::Primary;
+  const bool useMono = rasterMode == FontRasterMode::Mono;
 
-  // Check overflow cache first (matching both codepoint and style)
+  // Check overflow cache first (matching codepoint, style, and raster variant).
   for (uint32_t i = 0; i < self->overflowCount_; i++) {
-    if (self->overflow_[i].codepoint == codepoint && self->overflow_[i].styleIdx == styleIdx) {
+    if (self->overflow_[i].codepoint == codepoint && self->overflow_[i].styleIdx == styleIdx &&
+        self->overflow_[i].rasterMode == rasterMode) {
       return &self->overflow_[i].glyph;
     }
   }
@@ -1451,7 +1550,8 @@ const EpdGlyph* SdCardFont::onGlyphMiss(void* ctx, uint32_t codepoint) {
   }
 
   EpdGlyph tempGlyph = {};
-  uint32_t glyphFileOff = s.glyphsFileOffset + static_cast<uint32_t>(globalIdx) * sizeof(EpdGlyph);
+  const uint32_t glyphBase = useMono ? s.monoGlyphsFileOffset : s.glyphsFileOffset;
+  uint32_t glyphFileOff = glyphBase + static_cast<uint32_t>(globalIdx) * sizeof(EpdGlyph);
   if (!file.seekSet(glyphFileOff)) {
     LOG_ERR("SDCF", "Overflow: failed to seek to glyph for U+%04X style %u", codepoint, styleIdx);
     file.close();
@@ -1470,7 +1570,8 @@ const EpdGlyph* SdCardFont::onGlyphMiss(void* ctx, uint32_t codepoint) {
       LOG_ERR("SDCF", "Overflow: failed to allocate %u bytes for U+%04X bitmap", tempGlyph.dataLength, codepoint);
       return nullptr;
     }
-    if (!file.seekSet(s.bitmapFileOffset + tempGlyph.dataOffset)) {
+    const uint32_t bitmapBase = useMono ? s.monoBitmapFileOffset : s.bitmapFileOffset;
+    if (!file.seekSet(bitmapBase + tempGlyph.dataOffset)) {
       LOG_ERR("SDCF", "Overflow: failed to seek to bitmap for U+%04X", codepoint);
       delete[] tempBitmap;
       file.close();
@@ -1494,6 +1595,7 @@ const EpdGlyph* SdCardFont::onGlyphMiss(void* ctx, uint32_t codepoint) {
   self->overflow_[slot].bitmap = tempBitmap;
   self->overflow_[slot].codepoint = codepoint;
   self->overflow_[slot].styleIdx = styleIdx;
+  self->overflow_[slot].rasterMode = rasterMode;
 
   LOG_DBG("SDCF", "Overflow: loaded U+%04X style %u on demand (slot %u/%u)", codepoint, styleIdx, slot,
           OVERFLOW_CAPACITY);

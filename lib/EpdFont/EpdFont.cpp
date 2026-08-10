@@ -4,6 +4,22 @@
 
 #include <algorithm>
 
+const EpdFontData* EpdFont::getData() const {
+  if (preparedData_ && preparedMode_ == rasterMode_) return preparedData_;
+  if (rasterMode_ == FontRasterMode::Mono && data && data->monoVariant) return data->monoVariant;
+  return data;
+}
+
+const EpdGlyph* EpdFont::glyphAt(const EpdFontData* selected, const uint32_t glyphIndex) const {
+  if (!selected->compactGlyph) return &selected->glyph[glyphIndex];
+
+  const EpdCompactGlyph& compact = selected->compactGlyph[glyphIndex];
+  const EpdGlyph& layout = selected->layoutGlyph[glyphIndex];
+  glyphScratch_ = {compact.width, compact.height, layout.advanceX, compact.left, compact.top, compact.dataLength,
+                   glyphIndex};
+  return &glyphScratch_;
+}
+
 void EpdFont::getTextBounds(const char* string, const int startX, const int startY, int* minX, int* minY, int* maxX,
                             int* maxY) const {
   *minX = startX;
@@ -105,19 +121,21 @@ int8_t EpdFont::getKerning(const uint32_t leftCp, const uint32_t rightCp) const 
   if (utf8IsCjkBreakable(leftCp) || utf8IsCjkBreakable(rightCp)) {
     return 0;
   }
-  if (!data->kernMatrix) {
+  const EpdFontData* selected = getData();
+  if (!selected->kernMatrix) {
     return 0;
   }
-  const uint8_t lc = lookupKernClass(data->kernLeftClasses, data->kernLeftEntryCount, leftCp);
+  const uint8_t lc = lookupKernClass(selected->kernLeftClasses, selected->kernLeftEntryCount, leftCp);
   if (lc == 0) return 0;
-  const uint8_t rc = lookupKernClass(data->kernRightClasses, data->kernRightEntryCount, rightCp);
+  const uint8_t rc = lookupKernClass(selected->kernRightClasses, selected->kernRightEntryCount, rightCp);
   if (rc == 0) return 0;
-  return data->kernMatrix[(lc - 1) * data->kernRightClassCount + (rc - 1)];
+  return selected->kernMatrix[(lc - 1) * selected->kernRightClassCount + (rc - 1)];
 }
 
 uint32_t EpdFont::getLigature(const uint32_t leftCp, const uint32_t rightCp) const {
-  const auto* pairs = data->ligaturePairs;
-  const auto count = data->ligaturePairCount;
+  const EpdFontData* selected = getData();
+  const auto* pairs = selected->ligaturePairs;
+  const auto count = selected->ligaturePairCount;
   if (!pairs || count == 0 || leftCp > 0xFFFF || rightCp > 0xFFFF) {
     return 0;
   }
@@ -138,7 +156,8 @@ uint32_t EpdFont::getLigature(const uint32_t leftCp, const uint32_t rightCp) con
 }
 
 uint32_t EpdFont::applyLigatures(uint32_t cp, const char*& text) const {
-  if (!data->ligaturePairs || data->ligaturePairCount == 0) {
+  const EpdFontData* selected = getData();
+  if (!selected->ligaturePairs || selected->ligaturePairCount == 0) {
     return cp;
   }
   while (true) {
@@ -156,11 +175,12 @@ uint32_t EpdFont::applyLigatures(uint32_t cp, const char*& text) const {
 }
 
 const EpdGlyph* EpdFont::getGlyph(const uint32_t cp) const {
-  const int count = data->intervalCount;
-  if (count == 0 && !data->glyphMissHandler) return nullptr;
+  const EpdFontData* selected = getData();
+  const int count = selected->intervalCount;
+  if (count == 0 && !selected->glyphMissHandler) return nullptr;
 
   if (count > 0) {
-    const EpdUnicodeInterval* intervals = data->intervals;
+    const EpdUnicodeInterval* intervals = selected->intervals;
     const auto* end = intervals + count;
 
     // upper_bound: range lookup. Finds the first interval with first > cp, so the
@@ -172,14 +192,14 @@ const EpdGlyph* EpdFont::getGlyph(const uint32_t cp) const {
     if (it != intervals) {
       const auto& interval = *(it - 1);
       if (cp <= interval.last) {
-        return &data->glyph[interval.offset + (cp - interval.first)];
+        return glyphAt(selected, interval.offset + (cp - interval.first));
       }
     }
   }
 
   // Codepoint not in interval table — try on-demand loading (SD card fonts).
-  if (data->glyphMissHandler) {
-    const EpdGlyph* loaded = data->glyphMissHandler(data->glyphMissCtx, cp);
+  if (selected->glyphMissHandler) {
+    const EpdGlyph* loaded = selected->glyphMissHandler(selected->glyphMissCtx, cp);
     if (loaded) return loaded;
   }
 
@@ -190,9 +210,10 @@ const EpdGlyph* EpdFont::getGlyph(const uint32_t cp) const {
 }
 
 bool EpdFont::hasCodepoint(const uint32_t cp) const {
-  const int count = data->intervalCount;
+  const EpdFontData* selected = getData();
+  const int count = selected->intervalCount;
   if (count > 0) {
-    const EpdUnicodeInterval* intervals = data->intervals;
+    const EpdUnicodeInterval* intervals = selected->intervals;
     const auto* end = intervals + count;
     const auto it = std::upper_bound(
         intervals, end, cp, [](uint32_t value, const EpdUnicodeInterval& interval) { return value < interval.first; });
@@ -201,8 +222,8 @@ bool EpdFont::hasCodepoint(const uint32_t cp) const {
 
   // Interval table miss. SD card fonts only keep the current page's glyphs in
   // their interval table — ask their full RAM-resident coverage index instead.
-  if (data->coverageHandler) {
-    return data->coverageHandler(data->glyphMissCtx, cp);
+  if (selected->coverageHandler) {
+    return selected->coverageHandler(selected->glyphMissCtx, cp);
   }
   return false;
 }

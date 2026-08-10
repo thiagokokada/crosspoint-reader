@@ -352,9 +352,14 @@ void EpubReaderActivity::loop() {
         if (const auto p = section->loadPage(nextPage)) {
           if (auto* fcm = renderer.getFontCacheManager()) {
             const auto t0 = millis();
+            const int fontId = SETTINGS.getReaderFontId();
+            renderer.setFontRasterMode(fontId, SETTINGS.textAntiAliasing == CrossPointSettings::TEXT_AA_FAST
+                                                   ? FontRasterMode::Mono
+                                                   : FontRasterMode::Primary);
             auto scope = fcm->createPrewarmScope();
-            p->render(renderer, SETTINGS.getReaderFontId(), 0, 0);  // scan only, no pixels
+            p->render(renderer, fontId, 0, 0);  // scan only, no pixels
             scope.endScanAndPrewarm();
+            renderer.setFontRasterMode(fontId, FontRasterMode::Primary);
             LOG_DBG("ERS", "Idle prewarm: page %d in %lums", nextPage, millis() - t0);
           }
         }
@@ -1565,6 +1570,17 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
                                         const int orientedMarginLeft) {
   const auto t0 = millis();
   const int fontId = SETTINGS.getReaderFontId();
+  const bool fastAa = SETTINGS.textAntiAliasing == CrossPointSettings::TEXT_AA_FAST;
+  const FontRasterMode contentRaster = fastAa ? FontRasterMode::Mono : FontRasterMode::Primary;
+  struct RasterRestore {
+    GfxRenderer& renderer;
+    int fontId;
+    ~RasterRestore() { renderer.setFontRasterMode(fontId, FontRasterMode::Primary); }
+  } rasterRestore{renderer, fontId};
+  auto renderPageContent = [&]() {
+    renderer.setFontRasterMode(fontId, contentRaster);
+    page->render(renderer, fontId, orientedMarginLeft, orientedMarginTop);
+  };
 
   // The image pixel-cache RAM slot lives for exactly one page render (it feeds
   // the BW double-refresh and every grayscale band pass); release it on every
@@ -1576,7 +1592,7 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   // Font prewarm: scan pass accumulates text, then prewarm, then real render
   auto* fcm = renderer.getFontCacheManager();
   auto scope = fcm->createPrewarmScope();
-  page->render(renderer, fontId, orientedMarginLeft, orientedMarginTop);  // scan pass
+  renderPageContent();  // scan pass
   scope.endScanAndPrewarm();
   const auto tPrewarm = millis();
 
@@ -1590,7 +1606,7 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   // retained frame after a silent restart (for example, when returning from
   // KOReader sync), leaving the old UI mixed with the image.
   const bool cleanImageBasePending = manualRefreshPending || pagesUntilFullRefresh <= 1;
-  const bool needsTextGrayscale = SETTINGS.textAntiAliasing;
+  const bool needsTextGrayscale = SETTINGS.textAntiAliasing == CrossPointSettings::TEXT_AA_FULL;
   const bool needsAnyGrayscale = needsTextGrayscale || pageHasImages;
   const bool tiledGrayscale = needsAnyGrayscale && renderer.supportsStripGrayscale();
   // Whole-plane buffering only pays when the BW refresh genuinely runs async
@@ -1600,6 +1616,7 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   // nothing in flight to overlap.
   const bool overlapRefresh = tiledGrayscale && renderer.supportsAsyncRefresh() && !pageHasImages;
   auto renderGrayscalePass = [&]() {
+    renderer.setFontRasterMode(fontId, FontRasterMode::Primary);
     if (needsTextGrayscale) {
       page->render(renderer, fontId, orientedMarginLeft, orientedMarginTop);
     } else {
@@ -1608,13 +1625,16 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   };
 
   if (pageHasImagesNeedingDecode) {
+    renderer.setFontRasterMode(fontId, contentRaster);
     page->renderWithImagePlaceholders(renderer, fontId, orientedMarginLeft, orientedMarginTop);
+    renderer.setFontRasterMode(fontId, FontRasterMode::Primary);
     renderStatusBar();
     renderer.displayBuffer(HalDisplay::FAST_REFRESH);
     renderer.clearScreen();
   }
 
-  page->render(renderer, fontId, orientedMarginLeft, orientedMarginTop);
+  renderPageContent();
+  renderer.setFontRasterMode(fontId, FontRasterMode::Primary);
   renderStatusBar();
   const auto tBwRender = millis();
 
@@ -1636,7 +1656,7 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
 
       // Re-render page content to restore images into the blanked area
       // Status bar is not re-rendered here to avoid reading stale dynamic values (e.g. battery %)
-      page->render(renderer, fontId, orientedMarginLeft, orientedMarginTop);
+      renderPageContent();
       renderer.displayBuffer(HalDisplay::FAST_REFRESH);
     } else {
       renderer.displayBuffer(HalDisplay::HALF_REFRESH);

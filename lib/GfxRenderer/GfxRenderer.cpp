@@ -64,7 +64,9 @@ const uint8_t* GfxRenderer::getGlyphBitmap(const EpdFontData* fontData, const Ep
       LOG_ERR("GFX", "Compressed font but no FontDecompressor set");
       return nullptr;
     }
-    uint32_t glyphIndex = static_cast<uint32_t>(glyph - fontData->glyph);
+    const uint32_t glyphIndex = fontData->compactGlyph
+                                    ? glyph->dataOffset
+                                    : static_cast<uint32_t>(glyph - fontData->glyph);
     // For page-buffer hits the pointer is stable for the page lifetime.
     // For hot-group hits it is valid only until the next getBitmap() call — callers
     // must consume it (draw the glyph) before requesting another bitmap.
@@ -177,6 +179,11 @@ void GfxRenderer::insertFont(const int fontId, EpdFontFamily font) {
   if (!result.second) {
     LOG_ERR("GFX", "Font ID %d already registered, ignoring duplicate", fontId);
   }
+}
+
+void GfxRenderer::setFontRasterMode(const int fontId, const FontRasterMode mode) {
+  const auto it = fontMap.find(fontId);
+  if (it != fontMap.end()) it->second.setRasterMode(mode);
 }
 
 int GfxRenderer::resolveTextFontId(const int fontId, const char* text, const EpdFontFamily::Style style) const {

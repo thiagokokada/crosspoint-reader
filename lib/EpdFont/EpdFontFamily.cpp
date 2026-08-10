@@ -22,7 +22,14 @@ void EpdFontFamily::getTextDimensions(const char* string, int* w, int* h, const 
   getFont(style)->getTextDimensions(string, w, h);
 }
 
-const EpdFontData* EpdFontFamily::getData(const Style style) const { return getFont(style)->data; }
+const EpdFontData* EpdFontFamily::getData(const Style style) const { return getFont(style)->getData(); }
+
+void EpdFontFamily::setRasterMode(const FontRasterMode mode) const {
+  regular->setRasterMode(mode);
+  if (bold) bold->setRasterMode(mode);
+  if (italic) italic->setRasterMode(mode);
+  if (boldItalic) boldItalic->setRasterMode(mode);
+}
 
 const EpdGlyph* EpdFontFamily::getGlyph(const uint32_t cp, const Style style) const {
   return getFont(style)->getGlyph(cp);

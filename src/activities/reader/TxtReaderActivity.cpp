@@ -346,6 +346,14 @@ void TxtReaderActivity::render(RenderLock&&) {
 }
 
 void TxtReaderActivity::renderPage() {
+  const bool fastAa = SETTINGS.textAntiAliasing == CrossPointSettings::TEXT_AA_FAST;
+  renderer.setFontRasterMode(cachedFontId, fastAa ? FontRasterMode::Mono : FontRasterMode::Primary);
+  struct RasterRestore {
+    GfxRenderer& renderer;
+    int fontId;
+    ~RasterRestore() { renderer.setFontRasterMode(fontId, FontRasterMode::Primary); }
+  } rasterRestore{renderer, cachedFontId};
+
   const int lineHeight = renderer.getLineHeight(cachedFontId);
   const int contentWidth = viewportWidth;
 
@@ -397,11 +405,12 @@ void TxtReaderActivity::renderPage() {
 
   // BW rendering
   renderLines();
+  renderer.setFontRasterMode(cachedFontId, FontRasterMode::Primary);
   renderStatusBar();
 
   ReaderUtils::displayWithRefreshCycle(renderer, pagesUntilFullRefresh);
 
-  if (SETTINGS.textAntiAliasing) {
+  if (SETTINGS.textAntiAliasing == CrossPointSettings::TEXT_AA_FULL) {
     ReaderUtils::renderAntiAliased(renderer, [&renderLines]() { renderLines(); });
   }
   // scope destructor clears font cache via FontCacheManager

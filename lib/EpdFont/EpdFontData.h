@@ -138,6 +138,20 @@ typedef struct {
   uint32_t dataOffset;  ///< Pointer into EpdFont->bitmap (or within-group offset for compressed fonts)
 } EpdGlyph;
 
+/// Flash-efficient metadata for built-in monochrome glyphs. Advances come
+/// from layoutGlyph's EpdGlyph table; compressed offsets are derived from
+/// group membership and preceding glyph sizes.
+EPD_PACKED_BEGIN
+typedef struct {
+  uint8_t width;
+  uint8_t height;
+  int8_t left;
+  int8_t top;
+  uint8_t dataLength;
+} EPD_PACKED_ATTR EpdCompactGlyph;
+EPD_PACKED_END
+static_assert(sizeof(EpdCompactGlyph) == 5, "EpdCompactGlyph must remain flash-packed");
+
 /// Compressed font group: a DEFLATE-compressed block of glyph bitmaps
 typedef struct {
   uint32_t compressedOffset;  ///< Byte offset into compressed data array
@@ -173,7 +187,7 @@ typedef struct {
 EPD_PACKED_END
 
 /// Data stored for FONT AS A WHOLE
-typedef struct {
+typedef struct EpdFontData {
   const uint8_t* bitmap;                ///< Glyph bitmaps, concatenated
   const EpdGlyph* glyph;                ///< Glyph array
   const EpdUnicodeInterval* intervals;  ///< Valid unicode intervals for this font
@@ -213,4 +227,14 @@ typedef struct {
   /// answer from RAM-resident data without storage I/O.  Shares glyphMissCtx.
   /// nullptr for fonts whose interval table is already complete (built-ins).
   bool (*coverageHandler)(void* ctx, uint32_t codepoint);
+
+  /// Optional compact glyph metadata used by built-in mono variants.
+  /// When present, glyph is nullptr and layoutGlyph supplies advances.
+  const EpdCompactGlyph* compactGlyph;
+  const EpdGlyph* layoutGlyph;
+
+  /// Optional independently-rasterized monochrome variant. It owns bitmap,
+  /// glyph, and compression-group data while sharing layout and shaping data.
+  /// nullptr preserves the legacy primary-raster fallback.
+  const struct EpdFontData* monoVariant;
 } EpdFontData;

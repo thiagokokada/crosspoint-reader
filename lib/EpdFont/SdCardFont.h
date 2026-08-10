@@ -17,7 +17,8 @@
 // lib/EpdFont/scripts/cpfont_version.py. This firmware-side copy must be
 // bumped manually when the firmware is updated to support a new format.
 // Reader enforcement: SdCardFont::load().
-#define CPFONT_VERSION 4
+#define CPFONT_VERSION 5
+#define CPFONT_MIN_SUPPORTED_VERSION 4
 
 class SdCardFont {
  public:
@@ -34,7 +35,7 @@ class SdCardFont {
   SdCardFont& operator=(SdCardFont&&) = delete;
 
   // Load .cpfont file: reads header + intervals into RAM, records file layout offsets.
-  // Supports v4 (multi-style) format.
+  // Supports v4 (primary raster only) and v5 (optional dual raster).
   // Returns true on success.
   bool load(const char* path);
 
@@ -127,6 +128,7 @@ class SdCardFont {
     uint8_t kernLeftClassCount = 0;
     uint8_t kernRightClassCount = 0;
     uint8_t ligaturePairCount = 0;
+    bool hasMono = false;
   };
 
   // All per-style data: file offsets, intervals, kern/lig, prewarm cache, EpdFont
@@ -141,6 +143,8 @@ class SdCardFont {
     uint32_t kernMatrixFileOffset = 0;
     uint32_t ligatureFileOffset = 0;
     uint32_t bitmapFileOffset = 0;
+    uint32_t monoGlyphsFileOffset = 0;
+    uint32_t monoBitmapFileOffset = 0;
 
     // Full intervals loaded from file (kept in RAM for codepoint lookup)
     EpdUnicodeInterval* fullIntervals = nullptr;
@@ -168,6 +172,7 @@ class SdCardFont {
 
     // Stub EpdFontData returned when not prewarmed
     EpdFontData stubData{};
+    EpdFontData stubMonoData{};
 
     // Mini EpdFontData built during prewarm. Buffers are kept-if-fits across pages
     // (capacities below track allocated sizes): freeing and reallocating slightly
@@ -206,6 +211,7 @@ class SdCardFont {
     // hysteresis to one evaluation per rebuild (scopes reset twice, and subset
     // hits load nothing new to judge).
     bool miniHysteresisPending = false;
+    FontRasterMode miniRasterMode = FontRasterMode::Primary;
 
     // Per-page mini kern matrix (built by buildMiniKernMatrix on each full
     // prewarm). miniKernLeftClasses/miniKernRightClasses map ONLY the codepoints
@@ -250,6 +256,7 @@ class SdCardFont {
     uint8_t* bitmap = nullptr;
     uint32_t codepoint = 0;
     uint8_t styleIdx = 0;
+    FontRasterMode rasterMode = FontRasterMode::Primary;
   };
   OverflowEntry overflow_[OVERFLOW_CAPACITY] = {};
   uint32_t overflowCount_ = 0;
@@ -276,6 +283,7 @@ class SdCardFont {
   Stats stats_;
   uint32_t contentHash_ = 0;
   bool loaded_ = false;
+  uint16_t fileVersion_ = 0;
 
   // Per-style helpers
   void freeStyleMiniData(PerStyle& s);

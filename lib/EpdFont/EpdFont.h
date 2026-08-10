@@ -1,6 +1,8 @@
 #pragma once
 #include "EpdFontData.h"
 
+enum class FontRasterMode : uint8_t { Primary = 0, Mono = 1 };
+
 class EpdFont {
   void getTextBounds(const char* string, int startX, int startY, int* minX, int* minY, int* maxX, int* maxY) const;
 
@@ -31,4 +33,23 @@ class EpdFont {
   /// as many following codepoints from text as possible. Returns the
   /// (possibly substituted) codepoint; advances text past consumed chars.
   uint32_t applyLigatures(uint32_t cp, const char*& text) const;
+
+  void setRasterMode(FontRasterMode mode) const { rasterMode_ = mode; }
+  FontRasterMode getRasterMode() const { return rasterMode_; }
+  const EpdFontData* getData() const;
+
+  // SD fonts prepare one raster variant at a time into a page-sized cache.
+  void setPreparedData(const EpdFontData* prepared, FontRasterMode mode) const {
+    preparedData_ = prepared;
+    preparedMode_ = mode;
+  }
+  void clearPreparedData() const { preparedData_ = nullptr; }
+
+ private:
+  const EpdGlyph* glyphAt(const EpdFontData* selected, uint32_t glyphIndex) const;
+
+  mutable FontRasterMode rasterMode_ = FontRasterMode::Primary;
+  mutable FontRasterMode preparedMode_ = FontRasterMode::Primary;
+  mutable const EpdFontData* preparedData_ = nullptr;
+  mutable EpdGlyph glyphScratch_{};
 };

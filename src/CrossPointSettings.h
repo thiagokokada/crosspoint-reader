@@ -165,6 +165,11 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
 
   enum TOUCH_READER_CONTROLS { TOUCH_READER_OFF = 0, TOUCH_READER_ON = 1, TOUCH_READER_CONTROLS_COUNT };
 
+  // Persisted values: keep 1 as Full so existing enabled settings retain the
+  // original grayscale anti-aliasing behavior after upgrade.
+  enum TEXT_ANTI_ALIASING { TEXT_AA_OFF = 0, TEXT_AA_FULL = 1, TEXT_AA_FAST = 2, TEXT_AA_MODE_COUNT };
+  static_assert(TEXT_AA_FULL == 1, "persisted text AA value 1 must remain Full");
+
   enum QUICK_RESUME_SLEEP_SCREEN {
     QUICK_RESUME_NEVER = 0,
     QUICK_RESUME_AFTER_TIMEOUT = 1,
@@ -198,7 +203,7 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   uint8_t clockHasBeenSynced = 0;
   // Text rendering settings
   uint8_t extraParagraphSpacing = 1;
-  uint8_t textAntiAliasing = 1;
+  uint8_t textAntiAliasing = TEXT_AA_FULL;
   // Short power button click behaviour
   uint8_t shortPwrBtn = IGNORE;
   // EPUB reading orientation settings
